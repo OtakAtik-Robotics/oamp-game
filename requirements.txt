@@ -1,0 +1,10 @@
+numpy
+opencv-python
+torch
+customtkinter
+pillow
+scikit-learn
+requests
+python-dotenv
+mediapipe
+ultralytics
