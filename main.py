@@ -15,6 +15,7 @@ def main():
     load_dotenv()
 
     server = ServerClient()
+    room_id = os.getenv("MATCH_ROOM_ID")  # set for 1v1 mode
 
     from src.ui.game_window import _start_preload
     _start_preload()
@@ -25,6 +26,7 @@ def main():
         app = GameWindow(
             user_data=user_data,
             server_client=server,
+            room_id=room_id,
         )
 
         def maximize_window():

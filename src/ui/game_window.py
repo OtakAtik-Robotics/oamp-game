@@ -13,6 +13,7 @@ import customtkinter
 from PIL import Image, ImageTk
 
 from src.api_client import ServerClient
+from src.api.ws_client import MatchWSClient
 from src.ui.components import (
     TextFrame, ImageFrame,
     TimerDisplay, LevelBadge, StatusBar, CameraPanel,
@@ -123,11 +124,20 @@ class GameWindow(customtkinter.CTk):
         self,
         user_data: dict,
         server_client: Optional[ServerClient] = None,
+        room_id: Optional[str] = None,
     ):
         super().__init__()
         self.user_data     = user_data
         self.server_client = server_client
         self.session_id: Optional[str] = None
+
+        # WebSocket telemetry for 1v1 match mode
+        self._ws_client: Optional[MatchWSClient] = None
+        if room_id:
+            pid = user_data.get("participant_id", "unknown")
+            self._ws_client = MatchWSClient(
+                room_id=room_id, player_id=str(pid)
+            )
 
         self._setup_env()
         self._setup_window()
@@ -324,6 +334,8 @@ class GameWindow(customtkinter.CTk):
         self._hand_tracker.reset_session()
         self._show_level_btn()
         self._next_level()
+        if self._ws_client:
+            self._ws_client.start()
         self._stream()
 
     def _show_level_btn(self):
@@ -428,20 +440,25 @@ class GameWindow(customtkinter.CTk):
 
         print(f"=== HASIL === Avg: {avg:.2f}s | CogAge: {cog} | Fitness: {fit}%")
 
+        # WS: send GAME_OVER exactly once, before cleanup
+        if self._ws_client:
+            self._ws_client.send_game_over(
+                final_score=fit, blocks_hit=self._current_q,
+            )
+
         if self.server_client:
             participant_id = self.user_data.get("participant_id")
             if participant_id:
+                from datetime import datetime, timezone
                 payload = self.server_client.build_session_payload(
                     participant_id=participant_id,
                     game_data={
-                        "mode": "normal",
-                        "level_reached": self._current_q,
-                        "total_time": avg,
-                        "cognitive_age": cog,
-                        "visuo_spatial_fit": fit,
-                        "dexterity_score": 0,
+                        "game_score": fit,
+                        "blocks_hit": self._current_q,
+                        "hand_tracking_status": "active" if hand else "none",
+                        "play_duration": round(avg, 2),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
                     },
-                    expressions=[],
                 )
                 session_id = self.server_client.submit_game_session(payload)
                 if session_id:
@@ -516,11 +533,20 @@ class GameWindow(customtkinter.CTk):
             if self.server_client:
                 self._status_bar.set_server_online(self.server_client.is_online)
 
+        # WS telemetry — push on every frame (~100Hz is fine, ws_client throttles internally)
+        if self._ws_client:
+            self._ws_client.update(
+                score=self._current_q,
+                blocks_hit=len(self._latest_boxes),
+            )
+
         self.after(10, self._stream)
 
     # ─── Cleanup ──────────────────────────────────────────────────────────
 
     def cleanup(self):
+        if getattr(self, "_ws_client", None):
+            self._ws_client.stop()
         for cap in (self._cap_game,):
             if cap and cap.isOpened():
                 cap.release()

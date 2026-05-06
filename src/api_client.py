@@ -25,7 +25,10 @@ _MAX_UID_LEN = 64
 _UID_PATTERN = re.compile(r"^[A-Za-z0-9\-_:]+$")
 _VALID_BUFFER_TABLES = frozenset(("pending_sessions",))
 
-_REQUIRED_SESSION_FIELDS = ("mode", "level_reached", "total_time")
+_REQUIRED_SESSION_FIELDS = (
+    "participant_id", "game_score", "blocks_hit",
+    "hand_tracking_status", "play_duration", "timestamp",
+)
 
 
 def _init_db(db: sqlite3.Connection) -> None:
@@ -52,10 +55,7 @@ def _sanitize_uid(uid: str) -> Optional[str]:
 
 def _validate_session_data(session: dict) -> list[str]:
     """Return list of missing required fields (empty = valid)."""
-    missing = [f for f in _REQUIRED_SESSION_FIELDS if f not in session]
-    if "participant_id" not in session:
-        missing.append("participant_id")
-    return missing
+    return [f for f in _REQUIRED_SESSION_FIELDS if f not in session]
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +75,6 @@ class ServerClient:
         payload = client.build_session_payload(
             participant_id=child["id"],
             game_data={...},
-            expressions=[...],
         )
         session_id = client.submit_game_session(payload)
     """
@@ -235,7 +234,9 @@ class ServerClient:
         game_data: dict,
     ) -> Optional[dict]:
         """
-        Build session payload. Validates required fields.
+        Build session payload. Validates required fields:
+        participant_id, game_score, blocks_hit,
+        hand_tracking_status, play_duration, timestamp.
         Returns None if validation fails.
         """
         session = {"participant_id": participant_id, **game_data}
@@ -244,14 +245,14 @@ class ServerClient:
             logger.error("build_session_payload missing: %s", missing)
             return None
 
-        return {"session": session}
+        return session
 
     def submit_game_session(self, data: dict) -> Optional[int]:
         """
-        POST /api/v1/robot/sessions
+        POST /api/v1/game/submit
         Returns session_id or None. Buffers offline.
         """
-        body = self._post("/robot/sessions", data)
+        body = self._post("/game/submit", data)
         if body and body.get("status") == "success" and body.get("data"):
             session_id = body["data"].get("session_id")
             logger.info("Session submitted — id=%s", session_id)
@@ -289,7 +290,7 @@ class ServerClient:
             self._stop_sync.wait(_SYNC_INTERVAL)
             if not self._online:
                 continue
-            self._flush_table("pending_sessions", "/robot/sessions")
+            self._flush_table("pending_sessions", "/game/submit")
 
     def _flush_table(self, table: str, endpoint: str) -> None:
         """Send buffered rows to endpoint. Table name whitelisted."""
