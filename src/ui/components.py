@@ -177,8 +177,8 @@ class CameraPanel(customtkinter.CTkFrame):
 
 
 class StatusBar(customtkinter.CTkFrame):
-    """Status bar: server indicator, FPS, attempts. No voice/face."""
-    def __init__(self, master, **kw):
+    """Status bar: server indicator, FPS, attempts, settings. No voice/face."""
+    def __init__(self, master, on_settings_click=None, **kw):
         super().__init__(master, fg_color=BG_CARD, corner_radius=0, height=36, **kw)
         self.grid_propagate(False)
         self.grid_columnconfigure(3, weight=1)
@@ -199,7 +199,17 @@ class StatusBar(customtkinter.CTkFrame):
         self._att = customtkinter.CTkLabel(
             self, text="Percobaan: —", font=("Courier", 10), text_color=TEXT_DIM,
         )
-        self._att.grid(row=0, column=3, padx=(0, 16), pady=5, sticky="e")
+        self._att.grid(row=0, column=3, padx=(0, 8), pady=5, sticky="e")
+
+        if on_settings_click:
+            self._settings_btn = customtkinter.CTkButton(
+                self, text="⚙", font=("Helvetica", 14),
+                width=32, height=28, corner_radius=6,
+                fg_color="#e0e0e0", hover_color="#d0d0d0",
+                text_color="#333333",
+                command=on_settings_click,
+            )
+            self._settings_btn.grid(row=0, column=4, padx=(0, 12), pady=4)
 
     def set_server_online(self, online: bool):
         if online:

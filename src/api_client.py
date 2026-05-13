@@ -199,11 +199,10 @@ class ServerClient:
 
     def authenticate(self, uid: str) -> Optional[dict]:
         """
-        GET /api/v1/robot/auth/{uid}
-        Returns participant dict or None.
+        GET /api/v1/app/auth/{uid}
+        Returns participant dict (with numeric id) or None.
 
-        UID sanitized: alphanumeric, dash, underscore, colon only.
-        Max 64 chars.
+        UID = barcode identifier (e.g. "BCR-001").
         """
         safe_uid = _sanitize_uid(uid)
         if not safe_uid:
@@ -226,6 +225,18 @@ class ServerClient:
             return participant
 
         logger.warning("Authentication failed for UID %s", safe_uid)
+        return None
+
+    def lookup_by_id(self, participant_id: int) -> Optional[dict]:
+        """
+        GET /api/v1/participants/id/{id}
+        Returns participant dict by numeric ID or None.
+        """
+        body = self._get(f"/participants/id/{participant_id}")
+        if body and body.get("status") == "success" and body.get("data"):
+            logger.info("Lookup by id=%d: found", participant_id)
+            return body["data"]
+        logger.warning("Participant ID %d not found", participant_id)
         return None
 
     def build_session_payload(

@@ -34,12 +34,26 @@ class MatchWSClient:
         player_id: str,
         base_url: Optional[str] = None,
         tick_interval: float = 0.2,  # ~5 sends/sec
+        master_cfg: Optional[dict] = None,  # LAN push: {ip, port, player_id, room_id}
     ):
-        base = base_url or os.getenv("BACKEND_WS_URL", "ws://localhost:8080")
-        self._url = (
-            f"{base.rstrip('/')}/ws/match/{room_id}"
-            f"?role=player&player_id={player_id}"
-        )
+        # LAN master push: ws://{ip}:{port}/ws/match/{room_id}?role=player&player_id={pid}
+        if master_cfg:
+            ip = master_cfg.get("ip") or os.getenv("MASTER_IP", "localhost")
+            port = master_cfg.get("port") or os.getenv("MASTER_PORT", "8080")
+            rid = master_cfg.get("room_id") or room_id or os.getenv("ROOM_ID", "")
+            pid = master_cfg.get("player_id") or player_id
+            base = f"ws://{ip}:{port}"
+            self._url = (
+                f"{base.rstrip('/')}/ws/match/{rid}"
+                f"?role=player&player_id={pid}"
+            )
+            logger.info("LAN master push mode: %s", self._url)
+        else:
+            base = base_url or os.getenv("BACKEND_WS_URL", "ws://localhost:8080")
+            self._url = (
+                f"{base.rstrip('/')}/ws/match/{room_id}"
+                f"?role=player&player_id={player_id}"
+            )
         self._player_id = player_id
         self._tick_interval = tick_interval
 
@@ -74,10 +88,8 @@ class MatchWSClient:
         """Thread-safe telemetry state update. Sent on next tick."""
         with self._lock:
             self._latest = {
-                "player_id": self._player_id,
-                "score": score,
+                "game_score": score,
                 "blocks_hit": blocks_hit,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             self._dirty = True
 
@@ -85,7 +97,7 @@ class MatchWSClient:
     def connected(self) -> bool:
         return self._loop is not None and not self._stop_evt.is_set()
 
-    def send_game_over(self, final_score: int, blocks_hit: int):
+    def send_game_over(self, final_score: int, blocks_hit: int, play_duration: float = 0.0):
         """Send GAME_OVER payload exactly once, then signal stop."""
         if self._game_over_sent:
             return
@@ -93,17 +105,30 @@ class MatchWSClient:
         with self._lock:
             self._latest = {
                 "type": "GAME_OVER",
-                "data": {
-                    "player_id": self._player_id,
-                    "final_score": final_score,
-                    "blocks_hit": blocks_hit,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
+                "game_score": final_score,
+                "blocks_hit": blocks_hit,
+                "play_duration": play_duration,
             }
             self._dirty = True
-        # tick_loop will send the payload, then _game_over_evt breaks it
         if self._loop and self._game_over_evt:
             self._loop.call_soon_threadsafe(self._game_over_evt.set)
+
+    def send_score_update(self, score: int, blocks_hit: int):
+        """
+        Push SCORE_UPDATE immediately via async task (not throttled).
+        Fires on every collision hit — non-blocking.
+        """
+        if self._game_over_sent:
+            return
+        payload = {
+            "type": "SCORE_UPDATE",
+            "game_score": score,
+            "blocks_hit": blocks_hit,
+        }
+        if self._loop and not self._stop_evt.is_set():
+            asyncio.run_coroutine_threadsafe(
+                self._push_now(payload), self._loop
+            )
 
     # ── internals ─────────────────────────────────────────────────────────
 
@@ -119,7 +144,14 @@ class MatchWSClient:
         finally:
             self._loop.close()
 
-    async def _ws_loop(self):
+    async def _push_now(self, payload: dict):
+        """Immediate one-shot send, no waiting for tick loop."""
+        try:
+            async with websockets.connect(self._url) as ws:
+                await ws.send(json.dumps(payload))
+                logger.debug("SCORE_UPDATE pushed: %s", payload)
+        except Exception as e:
+            logger.warning("WS push failed: %s", e)
         while not self._stop_evt.is_set():
             try:
                 async with websockets.connect(self._url) as ws:

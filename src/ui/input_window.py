@@ -1,5 +1,11 @@
+import os
+import hashlib
 import customtkinter
 from typing import Optional
+
+SOLO_MODE = os.getenv("SOLO_MODE", "false").lower() == "true"
+BACKEND_OFFLINE = os.getenv("BACKEND_API_URL", "") == "offline"
+_SKIP_AUTH = SOLO_MODE or BACKEND_OFFLINE
 
 customtkinter.set_appearance_mode("Light")
 customtkinter.set_default_color_theme("blue")
@@ -187,8 +193,8 @@ class InputWindow(customtkinter.CTk):
         form.grid(row=1, column=0, sticky="nsew", padx=32, pady=(24, 0))
         form.grid_columnconfigure(0, weight=1)
 
-        # UID / RFID
-        self._uid = StyledEntry(form, label="UID / RFID (opsional)", placeholder="Tap kartu atau ketik UID...")
+        # ID Peserta
+        self._uid = StyledEntry(form, label="ID PESERTA", placeholder="Ketik ID numerik...")
         self._uid.grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
         self._uid_btn = customtkinter.CTkButton(
@@ -199,6 +205,30 @@ class InputWindow(customtkinter.CTk):
             command=self._lookup_uid,
         )
         self._uid_btn.grid(row=0, column=1, padx=(8, 0), pady=(20, 0), sticky="e")
+
+        # Participant ID numeric lookup
+        self._pid_entry = StyledEntry(form, label="ATAU CARI DENGAN ID", placeholder="Ketik ID numerik (cth: 1)...")
+        self._pid_entry.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        self._pid_btn = customtkinter.CTkButton(
+            form, text="Cek ID", width=80, height=36,
+            font=("Helvetica", 12), corner_radius=6,
+            fg_color=BG_INPUT, hover_color="#1e1e2e",
+            border_width=1, border_color=BORDER, text_color=MUTED,
+            command=self._lookup_pid,
+        )
+        self._pid_btn.grid(row=5, column=1, padx=(8, 0), pady=(20, 0), sticky="e")
+
+        # Room code for 1v1 — hidden in solo/offline mode
+        self._room_code = StyledEntry(form, label="KODE ROOM 1v1 (opsional)", placeholder="Contoh: AB12")
+        self._room_code.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        if _SKIP_AUTH:
+            self._uid.grid_remove()
+            self._uid_btn.grid_remove()
+            self._pid_entry.grid_remove()
+            self._pid_btn.grid_remove()
+            self._room_code.grid_remove()
 
         # Nama
         self._nama = StyledEntry(form, label="NAMA PANGGILAN", placeholder="Masukkan nama...")
@@ -262,12 +292,48 @@ class InputWindow(customtkinter.CTk):
             gender_val = data.get("gender", "").lower()
             if gender_val in ("male", "female"):
                 self._gender._select(gender_val)
-            print(f"[Input] Auto-fill dari server: {data.get('name') or uid}")
+            print(f"[Input] Auto-fill dari server (UID): {data.get('name') or uid}")
         else:
             self._auth_data = None
             print(f"[Input] UID '{uid}' tidak ditemukan / server offline")
 
         self._uid_btn.configure(text="Cari", state="normal")
+
+    def _lookup_pid(self):
+        """Lookup participant by numeric ID. Auto-fill form if found."""
+        pid_text = self._pid_entry.get().strip()
+        if not pid_text:
+            return
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            self._pid_entry.set_error("ID harus angka")
+            return
+
+        self._pid_btn.configure(text="...", state="disabled")
+        self._pid_entry.clear_error()
+        self.update()
+
+        data = None
+        if self._server:
+            data = self._server.lookup_by_id(pid)
+
+        if data:
+            self._auth_data = data
+            self._nama._entry.delete(0, "end")
+            self._nama._entry.insert(0, str(data.get("name", "")))
+            usia_val = data.get("age", "")
+            self._usia._entry.delete(0, "end")
+            self._usia._entry.insert(0, str(usia_val) if usia_val else "")
+            gender_val = data.get("gender", "").lower()
+            if gender_val in ("male", "female"):
+                self._gender._select(gender_val)
+            print(f"[Input] Auto-fill dari server (ID {pid}): {data.get('name')}")
+        else:
+            self._auth_data = None
+            self._pid_entry.set_error(f"ID {pid} tidak ditemukan")
+
+        self._pid_btn.configure(text="Cek ID", state="normal")
 
     def _submit(self):
         self._nama.clear_error()
@@ -302,6 +368,16 @@ class InputWindow(customtkinter.CTk):
         }
         if self._auth_data and self._auth_data.get("id"):
             self._result["participant_id"] = self._auth_data["id"]
+        elif _SKIP_AUTH:
+            # SOLO_MODE or BACKEND_OFFLINE: generate local participant_id
+            seed = f"{nama}{usia}{gender}".encode()
+            local_id = int(hashlib.md5(seed).hexdigest()[:8], 16) % 100000
+            self._result["participant_id"] = local_id
+            print(f"[Input] SOLO MODE — local participant_id: {local_id}")
+        # Room code — pass through regardless of mode
+        room = self._room_code.get().strip().upper()
+        if room:
+            self._result["room_code"] = room
         print(f"[Input] Data peserta: {self._result}")
         self.destroy()
 

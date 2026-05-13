@@ -14,10 +14,12 @@ from PIL import Image, ImageTk
 
 from src.api_client import ServerClient
 from src.api.ws_client import MatchWSClient
+from src.core.audio_manager import AudioManager
 from src.ui.components import (
     TextFrame, ImageFrame,
     TimerDisplay, LevelBadge, StatusBar, CameraPanel,
 )
+from src.ui.settings_panel import CameraPropertyStore, CameraSettingsPanel
 from src.vision.hand_tracker import HandTracker
 from src.vision.block_detector import BlockDetector
 from src.vision.evaluator import BlockEvaluator
@@ -133,11 +135,36 @@ class GameWindow(customtkinter.CTk):
 
         # WebSocket telemetry for 1v1 match mode
         self._ws_client: Optional[MatchWSClient] = None
-        if room_id:
+        master_ip = os.getenv("MASTER_IP", "")
+        room_client = user_data.get("room_client")  # RoomClient from lobby flow
+
+        if master_ip:
+            pid = str(user_data.get("participant_id", "unknown"))
+            self._ws_client = MatchWSClient(
+                room_id=os.getenv("ROOM_ID", room_id or ""),
+                player_id=pid,
+                master_cfg={"ip": master_ip, "port": os.getenv("MASTER_PORT", "8080")},
+            )
+        elif room_client and room_id:
+            # Multiplayer lobby flow — use player info from RoomClient
+            pid = str(user_data.get("participant_id", "unknown"))
+            self._ws_client = MatchWSClient(
+                room_id=room_id,
+                player_id=pid,
+            )
+        elif room_id:
             pid = user_data.get("participant_id", "unknown")
             self._ws_client = MatchWSClient(
                 room_id=room_id, player_id=str(pid)
             )
+
+        # Arcade SFX — base_dir computed before _setup_env
+        self.base_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..")
+        )
+        self._audio = AudioManager(base_dir=self.base_dir)
+        self._prev_hit = False  # debounce hit SFX (fire once per hit event)
+        self._hit_count = 0  # total hits pushed to LAN master
 
         self._setup_env()
         self._setup_window()
@@ -156,6 +183,7 @@ class GameWindow(customtkinter.CTk):
         self.max_level    = min(max(int(os.getenv("MAX_LEVEL", "8")), 1), 8)
         self.yolo_skip    = int(os.getenv("YOLO_SKIP_FRAMES",      "2"))
         self.mp_skip      = int(os.getenv("MEDIAPIPE_SKIP_FRAMES",  "2"))
+        self.level_time_limit = int(os.getenv("LEVEL_TIME_LIMIT", "30"))
         self.cam_game_idx = int(os.getenv("CAMERA_GAME_INDEX", os.getenv("CAMERA_INDEX", "0")))
         self.base_dir     = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "..")
@@ -219,8 +247,11 @@ class GameWindow(customtkinter.CTk):
         else:
             self._cam_panel = None
 
-        self._status_bar = StatusBar(self)
+        self._status_bar = StatusBar(self, on_settings_click=self._open_settings)
         self._status_bar.grid(row=1, column=0, sticky="ew")
+
+        # Camera property store — shared between settings panel + capture loop
+        self._cam_store = CameraPropertyStore()
 
     def _setup_game_state(self):
         self._timer_running = False
@@ -255,15 +286,50 @@ class GameWindow(customtkinter.CTk):
             return False
         return True
 
+    def _on_capture_callback(self, action: str, value):
+        """Handle camera reopen/reconfig from settings panel."""
+        if action == "reopen":
+            # value can be camera index (int) or stream_url (str with rtsp/http)
+            if isinstance(value, str) and value.startswith(("rtsp://", "http://", "https://")):
+                url = value
+                if self._cap_game and self._cap_game.isOpened():
+                    self._cap_game.release()
+                self._cap_game = cv2.VideoCapture(url)
+                self._game_cam_ok = self._cap_game.isOpened()
+                if not self._game_cam_ok:
+                    self._cap_game = None
+            else:
+                idx = int(value)
+                if self._cap_game and self._cap_game.isOpened():
+                    self._cap_game.release()
+                self._cap_game = cv2.VideoCapture(idx)
+                self._cam_store.apply_capture_properties(self._cap_game)
+                self._game_cam_ok = self._cam_probe(self._cap_game, "Kamera game", idx)
+                if not self._game_cam_ok:
+                    self._cap_game = None
+        elif action == "reconfig":
+            w, h = value
+            if self._cap_game and self._cap_game.isOpened():
+                self._cap_game.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+                self._cap_game.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+
     def _setup_ai(self):
-        self._cap_game = cv2.VideoCapture(self.cam_game_idx)
-        self._cap_game.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-        self._cap_game.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self._game_cam_ok = self._cam_probe(
-            self._cap_game, "Kamera game", self.cam_game_idx
-        )
-        if not self._game_cam_ok:
-            self._cap_game = None
+        # Stream URL (IP camera) takes priority over local camera index
+        stream_url = self._cam_store.stream_url
+        if stream_url:
+            self._cap_game = cv2.VideoCapture(stream_url)
+            self._game_cam_ok = self._cap_game.isOpened()
+            if not self._game_cam_ok:
+                print(f">>> [DEBUG] Stream URL failed: {stream_url}")
+                self._cap_game = None
+        else:
+            self._cap_game = cv2.VideoCapture(self.cam_game_idx)
+            self._cam_store.apply_capture_properties(self._cap_game)
+            self._game_cam_ok = self._cam_probe(
+                self._cap_game, "Kamera game", self.cam_game_idx
+            )
+            if not self._game_cam_ok:
+                self._cap_game = None
 
         self._hand_tracker = HandTracker(draw_style="rich")
 
@@ -334,6 +400,46 @@ class GameWindow(customtkinter.CTk):
         self._hand_tracker.reset_session()
         self._show_level_btn()
         self._next_level()
+        self._do_countdown()
+
+    # ─── Countdown callbacks as bound methods (survive GC) ──────────────────────
+
+    def _countdown_tick(self, label, step, next_cb):
+        try:
+            self._audio.play_countdown()
+        except Exception:
+            pass
+        label.configure(text=step)
+        if next_cb:
+            self.after(1000, next_cb)
+        else:
+            label.configure(text="GO!", text_color=GREEN)
+            self.after(600, self._countdown_overlay.destroy)
+            self.after(600, self._start_ws_and_stream)
+
+    def _countdown_step2(self):
+        self._countdown_tick(self._countdown_label, "2", self._countdown_step1)
+
+    def _countdown_step1(self):
+        self._countdown_tick(self._countdown_label, "1", None)
+
+    def _do_countdown(self):
+        """3..2..1..GO! overlay + audio, then start _stream."""
+        self._countdown_overlay = customtkinter.CTkFrame(self, fg_color="#000000", corner_radius=0)
+        self._countdown_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._countdown_overlay.grid_columnconfigure(0, weight=1)
+        self._countdown_overlay.grid_rowconfigure(0, weight=1)
+
+        self._countdown_label = customtkinter.CTkLabel(
+            self._countdown_overlay, text="3",
+            font=("Courier", 120, "bold"), text_color=YELLOW,
+        )
+        self._countdown_label.grid(row=0, column=0, sticky="nsew")
+
+        # Start: 3 → step2 → step1 → None
+        self._countdown_tick(self._countdown_label, "3", self._countdown_step2)
+
+    def _start_ws_and_stream(self):
         if self._ws_client:
             self._ws_client.start()
         self._stream()
@@ -384,6 +490,7 @@ class GameWindow(customtkinter.CTk):
         self._show_score_flash(elapsed)
         self._shake()
         self._level_badge.set_completed(self._current_q)
+        self._audio.play_levelup()
 
         if self._current_q >= self.max_level:
             self._end_game()
@@ -404,6 +511,13 @@ class GameWindow(customtkinter.CTk):
         elif elapsed < 32: return 11
         elif elapsed < 40: return 12
         return 13
+
+    def _open_settings(self):
+        if getattr(self, "_settings_win", None) and self._settings_win.winfo_exists():
+            self._settings_win.lift()
+            return
+        self._settings_win = CameraSettingsPanel(self._cam_store)
+        self._settings_win.attributes("-topmost", True)
 
     def _on_skip(self):
         if self._timer_running:
@@ -444,7 +558,11 @@ class GameWindow(customtkinter.CTk):
         if self._ws_client:
             self._ws_client.send_game_over(
                 final_score=fit, blocks_hit=self._current_q,
+                play_duration=round(avg, 2),
             )
+
+        # Arcade SFX
+        self._audio.play_gameover()
 
         if self.server_client:
             participant_id = self.user_data.get("participant_id")
@@ -477,7 +595,7 @@ class GameWindow(customtkinter.CTk):
             font=("Helvetica", 13, "bold"), height=44,
             corner_radius=8, fg_color=RED,
             hover_color="#B71C1C", text_color="#ffffff",
-            command=self.destroy,
+            command=self._on_retry,
         ).grid(row=3, column=0, columnspan=2, padx=12, pady=(0, 12), sticky="ew")
 
     # ─── Stream ────────────────────────────────────────────────────────────
@@ -487,6 +605,7 @@ class GameWindow(customtkinter.CTk):
             if self._game_cam_ok and self._cap_game and self._cap_game.isOpened():
                 ret, frame = self._cap_game.read()
                 if ret:
+                    frame = self._cam_store.apply_flip(frame)
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
                     if self._frame_count % (self.mp_skip + 1) == 0:
@@ -496,6 +615,31 @@ class GameWindow(customtkinter.CTk):
 
                     if self._hand_tracker.check_peace_gesture():
                         self.after(0, self._on_skip)
+
+                    # Hit SFX: hand intersects any block box
+                    if self._latest_boxes and self._hand_tracker._cached_hands:
+                        h, w = frame_rgb.shape[:2]
+                        hand_hits = False
+                        for lmk in self._hand_tracker._cached_hands[0]:
+                            hx = int(lmk.x * w)
+                            hy = int(lmk.y * h)
+                            for box in self._latest_boxes:
+                                bx1, by1, bx2, by2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                                if bx1 <= hx <= bx2 and by1 <= hy <= by2:
+                                    hand_hits = True
+                                    break
+                        if hand_hits and not self._prev_hit:
+                            self._audio.play_hit()
+                            self._hit_count += 1
+                            self._prev_hit = True
+                            # LAN master push on every hit
+                            if self._ws_client:
+                                self._ws_client.send_score_update(
+                                    score=self._current_q,
+                                    blocks_hit=self._hit_count,
+                                )
+                        elif not hand_hits:
+                            self._prev_hit = False
 
                     if self._yolo:
                         if self._frame_count % (self.yolo_skip + 1) == 0:
@@ -540,6 +684,11 @@ class GameWindow(customtkinter.CTk):
                 blocks_hit=len(self._latest_boxes),
             )
 
+        # Tension tick: remaining <= 10s → play_tick() (1/sec cooldown built into AudioManager)
+        elapsed = time.time() - self._start_task
+        if elapsed >= (self.level_time_limit - 10):
+            self._audio.play_tick()
+
         self.after(10, self._stream)
 
     # ─── Cleanup ──────────────────────────────────────────────────────────
@@ -558,6 +707,10 @@ class GameWindow(customtkinter.CTk):
             self.server_client.stop()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def _on_retry(self):
+        """Destroy game window → main() loop returns to Input Window."""
+        self.destroy()
 
     def destroy(self):
         self.cleanup()
