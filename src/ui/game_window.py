@@ -20,9 +20,20 @@ from src.ui.components import (
     TimerDisplay, LevelBadge, StatusBar, CameraPanel,
 )
 from src.ui.settings_panel import CameraPropertyStore, CameraSettingsPanel
-from src.vision.hand_tracker import HandTracker
 from src.vision.block_detector import BlockDetector
 from src.vision.evaluator import BlockEvaluator
+
+# HandTracker loaded lazily — MediaPipe init slow on Windows
+_HandTracker = None
+def _get_hand_tracker():
+    global _HandTracker
+    if _HandTracker is None:
+        try:
+            from src.vision.hand_tracker import HandTracker
+            _HandTracker = HandTracker
+        except Exception:
+            _HandTracker = False
+    return _HandTracker
 
 logger = logging.getLogger("game_window")
 
@@ -165,6 +176,8 @@ class GameWindow(customtkinter.CTk):
         self._audio = AudioManager(base_dir=self.base_dir)
         self._prev_hit = False  # debounce hit SFX (fire once per hit event)
         self._hit_count = 0  # total hits pushed to LAN master
+
+        self._hand_tracker = None  # lazy load — MediaPipe slow on Windows
 
         self._setup_env()
         self._setup_window()
@@ -331,7 +344,16 @@ class GameWindow(customtkinter.CTk):
             if not self._game_cam_ok:
                 self._cap_game = None
 
-        self._hand_tracker = HandTracker(draw_style="rich")
+        # Lazy load HandTracker — skip if MediaPipe unavailable
+        HT = _get_hand_tracker()
+        if HT:
+            try:
+                self._hand_tracker = HT(draw_style="rich")
+            except Exception as e:
+                print(f">>> [DEBUG] HandTracker init failed: {e}")
+                self._hand_tracker = None
+        else:
+            self._hand_tracker = None
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         use_bantal = os.getenv("MODEL_BANTAL", "false").lower() == "true"
@@ -397,7 +419,8 @@ class GameWindow(customtkinter.CTk):
 
     def _on_start(self):
         self._start_btn.grid_remove()
-        self._hand_tracker.reset_session()
+        if self._hand_tracker:
+            self._hand_tracker.reset_session()
         self._show_level_btn()
         self._next_level()
         self._do_countdown()
@@ -464,8 +487,9 @@ class GameWindow(customtkinter.CTk):
         if self._level_btn:
             self._level_btn.configure(text=f"Level {self._current_q}")
         self._load_image(variant)
-        self._hand_tracker.reset_session()
-        self._hand_tracker.reset_gesture()
+        if self._hand_tracker:
+            self._hand_tracker.reset_session()
+            self._hand_tracker.reset_gesture()
         self._start_task = time.time()
         self._reset_timer()
         self._start_timer()
@@ -522,6 +546,8 @@ class GameWindow(customtkinter.CTk):
     def _on_skip(self):
         if self._timer_running:
             self._complete_level(time.time() - self._start_task)
+        if self._hand_tracker:
+            self._hand_tracker.reset_gesture()
 
     def _show_score_flash(self, elapsed: float):
         flash = customtkinter.CTkFrame(
@@ -550,7 +576,7 @@ class GameWindow(customtkinter.CTk):
         age = self.user_data.get("age", 0)
         cog = int(sum(self._cog_ages) / len(self._cog_ages)) if self._cog_ages else age
         fit = 100 if cog <= age else max(0, 100 - (cog - age))
-        hand = self._hand_tracker.flush_buffer()
+        hand = self._hand_tracker.flush_buffer() if self._hand_tracker else None
 
         print(f"=== HASIL === Avg: {avg:.2f}s | CogAge: {cog} | Fitness: {fit}%")
 
@@ -608,38 +634,35 @@ class GameWindow(customtkinter.CTk):
                     frame = self._cam_store.apply_flip(frame)
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                    if self._frame_count % (self.mp_skip + 1) == 0:
-                        self._hand_tracker.detect(frame_rgb)
-
-                    frame_rgb = self._hand_tracker.draw_cached(frame_rgb)
-
-                    if self._hand_tracker.check_peace_gesture():
-                        self.after(0, self._on_skip)
-
-                    # Hit SFX: hand intersects any block box
-                    if self._latest_boxes and self._hand_tracker._cached_hands:
-                        h, w = frame_rgb.shape[:2]
-                        hand_hits = False
-                        for lmk in self._hand_tracker._cached_hands[0]:
-                            hx = int(lmk.x * w)
-                            hy = int(lmk.y * h)
-                            for box in self._latest_boxes:
-                                bx1, by1, bx2, by2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-                                if bx1 <= hx <= bx2 and by1 <= hy <= by2:
-                                    hand_hits = True
-                                    break
-                        if hand_hits and not self._prev_hit:
-                            self._audio.play_hit()
-                            self._hit_count += 1
-                            self._prev_hit = True
-                            # LAN master push on every hit
-                            if self._ws_client:
-                                self._ws_client.send_score_update(
-                                    score=self._current_q,
-                                    blocks_hit=self._hit_count,
-                                )
-                        elif not hand_hits:
-                            self._prev_hit = False
+                    if self._hand_tracker:
+                        if self._frame_count % (self.mp_skip + 1) == 0:
+                            self._hand_tracker.detect(frame_rgb)
+                        frame_rgb = self._hand_tracker.draw_cached(frame_rgb)
+                        if self._hand_tracker.check_peace_gesture():
+                            self.after(0, self._on_skip)
+                        # Hit SFX: hand intersects any block box
+                        if self._latest_boxes and self._hand_tracker._cached_hands:
+                            h, w = frame_rgb.shape[:2]
+                            hand_hits = False
+                            for lmk in self._hand_tracker._cached_hands[0]:
+                                hx = int(lmk.x * w)
+                                hy = int(lmk.y * h)
+                                for box in self._latest_boxes:
+                                    bx1, by1, bx2, by2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                                    if bx1 <= hx <= bx2 and by1 <= hy <= by2:
+                                        hand_hits = True
+                                        break
+                            if hand_hits and not self._prev_hit:
+                                self._audio.play_hit()
+                                self._hit_count += 1
+                                self._prev_hit = True
+                                if self._ws_client:
+                                    self._ws_client.send_score_update(
+                                        score=self._current_q,
+                                        blocks_hit=self._hit_count,
+                                    )
+                            elif not hand_hits:
+                                self._prev_hit = False
 
                     if self._yolo:
                         if self._frame_count % (self.yolo_skip + 1) == 0:
