@@ -62,29 +62,33 @@ LEVEL_COLORS = {
 
 _PRELOAD_DONE = False
 _PRELOAD_ERR  = None
+_YOLO_PRELOADED = None
+_USE_BANTAL_PRELOADED = False
 _preload_lock = threading.Lock()
 
 
 def _background_preload():
     global _PRELOAD_DONE, _PRELOAD_ERR
-    try:
-        from src.vision.hand_tracker import HandTracker
-        base_dir = os.path.join(os.path.dirname(__file__), "..", "..")
-        device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        use_bantal = os.getenv("MODEL_BANTAL", "false").lower() == "true"
+    base_dir = os.path.join(os.path.dirname(__file__), "..", "..")
+    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_bantal = os.getenv("MODEL_BANTAL", "false").lower() == "true"
 
+    try:
         if use_bantal:
             p = os.path.join(base_dir, "models", "weights", "bantal.pt")
             from ultralytics import YOLO
-            YOLO(p).to(device)
+            _YOLO_PRELOADED = YOLO(p); _YOLO_PRELOADED.to(device)
         else:
             p = os.path.join(base_dir, "models", "weights", "best.pt")
-            torch.hub.load(
+            _YOLO_PRELOADED = torch.hub.load(
                 os.path.join(base_dir, "models", "yolov5"),
                 "custom", path=p, force_reload=True, source="local",
-            ).to(device)
+            ); _YOLO_PRELOADED.to(device)
+        _USE_BANTAL_PRELOADED = use_bantal
     except Exception as e:
         _PRELOAD_ERR = e
+        _YOLO_PRELOADED = None
+        _USE_BANTAL_PRELOADED = False
     finally:
         with _preload_lock:
             _PRELOAD_DONE = True
@@ -183,7 +187,10 @@ class GameWindow(customtkinter.CTk):
         self._setup_window()
         self._setup_layout()
         self._setup_game_state()
-        self._setup_ai()
+
+        # Defer heavy init to background — window renders immediately
+        # YOLO + camera probe + BlockDetector all slow on Windows
+        self.after(0, self._setup_ai)
         self._preload_images()
 
         self.bind("<Return>", lambda _: self._on_skip())
@@ -357,43 +364,71 @@ class GameWindow(customtkinter.CTk):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         use_bantal = os.getenv("MODEL_BANTAL", "false").lower() == "true"
+        self._yolo_lock = threading.Lock()
+        self._yolo = None
+
+        # Use preloaded model if available (loaded during input window)
+        # Otherwise load in background thread
         model_yolo = None
+        use_bantal = os.getenv("MODEL_BANTAL", "false").lower() == "true"
 
-        if use_bantal:
-            p = os.path.join(self.base_dir, "models", "weights", "bantal.pt")
-            try:
-                from ultralytics import YOLO
-                model_yolo = YOLO(p); model_yolo.to(device)
-            except Exception:
-                use_bantal = False
-
-        if not use_bantal:
-            p = os.path.join(self.base_dir, "models", "weights", "best.pt")
-            try:
-                model_yolo = torch.hub.load(
-                    os.path.join(self.base_dir, "models", "yolov5"),
-                    "custom", path=p, force_reload=True, source="local",
-                ); model_yolo.to(device)
-            except Exception as e:
-                print(f"[YOLO] Gagal load: {e}")
+        with _preload_lock:
+            if _PRELOAD_DONE and _YOLO_PRELOADED is not None:
+                model_yolo = _YOLO_PRELOADED
+                use_bantal = _USE_BANTAL_PRELOADED
+                _YOLO_PRELOADED = None  # take ownership
 
         if model_yolo:
-            self._yolo = BlockDetector(model_yolo, use_bantal, confidence=0.7)
-            self._yolo.start()
+            with self._yolo_lock:
+                self._yolo = BlockDetector(model_yolo, use_bantal, confidence=0.7)
+                self._yolo.start()
+            print(">[YOLO] Using preloaded model")
         else:
-            self._yolo = None
+            # Fallback: load in background if preload hasn't finished
+            def _load_yolo():
+                nonlocal model_yolo
+                p = os.path.join(self.base_dir, "models", "weights",
+                                "bantal.pt" if use_bantal else "best.pt")
+                try:
+                    if use_bantal:
+                        from ultralytics import YOLO
+                        model_yolo = YOLO(p); model_yolo.to(device)
+                    else:
+                        model_yolo = torch.hub.load(
+                            os.path.join(self.base_dir, "models", "yolov5"),
+                            "custom", path=p, force_reload=True, source="local",
+                        ); model_yolo.to(device)
+                except Exception as e:
+                    print(f"[YOLO] Gagal load: {e}")
+                    model_yolo = None
+                with self._yolo_lock:
+                    if model_yolo:
+                        self._yolo = BlockDetector(model_yolo, use_bantal, confidence=0.7)
+                        self._yolo.start()
+                        print(">[YOLO] loaded async")
+            t = threading.Thread(target=_load_yolo, daemon=True, name="YoloLoad")
+            t.start()
 
     def _preload_images(self):
-        base = os.path.join(self.base_dir, "assets", "images", "FILES", "TEST_RANDOM_1500x1500")
-        for lvl in range(1, 9):
-            for var in "abcd":
-                key  = f"{lvl}{var}"
-                path = os.path.join(base, f"Lvl {key}.png")
-                if os.path.exists(path):
-                    img = Image.open(path).resize(
-                        (self.frame_w, self.frame_h), Image.Resampling.LANCZOS
-                    )
-                    self._cached_images[key] = img
+        """Load images in background thread — UI stays responsive."""
+        def _load():
+            base = os.path.join(self.base_dir, "assets", "images", "FILES", "TEST_RANDOM_1500x1500")
+            for lvl in range(1, 9):
+                for var in "abcd":
+                    key  = f"{lvl}{var}"
+                    path = os.path.join(base, f"Lvl {key}.png")
+                    if os.path.exists(path):
+                        try:
+                            img = Image.open(path).resize(
+                                (self.frame_w, self.frame_h), Image.Resampling.LANCZOS
+                            )
+                            with self._img_lock:
+                                self._cached_images[key] = img
+                        except Exception:
+                            pass
+        self._img_lock = threading.Lock()
+        t = threading.Thread(target=_load, daemon=True, name="ImgPreload")
+        t.start()
 
     # ─── Timer ─────────────────────────────────────────────────────────────
 
@@ -496,7 +531,9 @@ class GameWindow(customtkinter.CTk):
         self._status_bar.set_attempts(0)
 
     def _load_image(self, variant: str):
-        img = self._cached_images.get(variant)
+        img = None
+        with self._img_lock:
+            img = self._cached_images.get(variant)
         if not img:
             return
         self._img = customtkinter.CTkImage(light_image=img, size=(self.frame_w, self.frame_h))

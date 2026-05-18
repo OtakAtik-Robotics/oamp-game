@@ -51,7 +51,7 @@ class AudioManager:
         self._last_tick_ts = 0.0
         self._tick_cooldown = 1.0  # seconds
 
-        self._init_pygame()
+        # Lazy init — pygame + preload on first play, not at construction
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -91,6 +91,14 @@ class AudioManager:
 
     # ── internals ────────────────────────────────────────────────────────────
 
+    def _ensure_started(self):
+        if self._started:
+            return
+        with self._lock:
+            if self._started:
+                return
+            self._init_pygame()
+
     def _init_pygame(self):
         try:
             # SDL init must happen in same thread that uses mixer
@@ -118,7 +126,9 @@ class AudioManager:
     def _play(self, name: str):
         """Non-blocking play on mixer channel. Thread-safe."""
         if not self._started:
-            return
+            self._ensure_started()
+        if not self._started:
+            return  # pygame not available
         with self._lock:
             sound = self._sounds.get(name)
         if sound:
