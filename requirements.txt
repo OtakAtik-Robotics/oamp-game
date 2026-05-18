@@ -1,12 +1,18 @@
+# Core
 numpy
 opencv-python
 torch
-customtkinter
 pillow
 scikit-learn
+
+# UI
+customtkinter
+
+# Networking
 requests
-python-dotenv
-mediapipe
-ultralytics
 websockets
-pygame
+
+# Optional (lazy-loaded — auto-skip if unavailable)
+mediapipe      # hand tracking; not required for YOLO-only mode
+ultralytics    # YOLO v8 format (.pt); not required for torch.hub YOLOv5
+pygame         # audio playback; silent fallback if unavailable
